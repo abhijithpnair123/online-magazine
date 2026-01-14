@@ -36,6 +36,7 @@ $conn->close();
     <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
+    <?php include 'includes/header.php'; ?>
     <div class="dashboard-container">
         <?php include 'includes/sidebar.php'; ?>
         <div class="main-content">

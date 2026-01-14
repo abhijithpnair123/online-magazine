@@ -1,9 +1,21 @@
 <?php
+session_start();
+
+// --- Add PHPMailer ---
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+require 'PHPMailer/src/Exception.php';
+require 'PHPMailer/src/PHPMailer.php';
+require 'PHPMailer/src/SMTP.php';
+// --- End PHPMailer ---
+
 include 'db_connect.php';
 
 $registrationError = '';
 $registrationSuccess = '';
+$show_otp_modal = false;
 
+// STEP 1: Registration request
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_student'])) {
     $student_name = $conn->real_escape_string($_POST['student_name']);
     $email = $conn->real_escape_string($_POST['email']);
@@ -14,12 +26,14 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_student'])) {
     $program_id = (int)$_POST['program_id'];
     $gender = $conn->real_escape_string($_POST['gender']);
 
-    if ($password !== $confirm_password) {
-        $registrationError = "Passwords do not match.";
-    } else {
-        // Hash the password securely
-        $hashed_password = password_hash($password, PASSWORD_DEFAULT);
+    // --- Enforce Rajagiri email domain ---
+   if (!str_ends_with($email, '@rajagiricollege.edu.in')) {
+    $registrationError = "❌ Registration allowed only with @rajagiricollege.edu.in email addresses.";
+}
 
+    elseif ($password !== $confirm_password) {
+        $registrationError = "❌ Passwords do not match.";
+    } else {
         // Check if email already exists
         $stmt_check_email = $conn->prepare("SELECT email FROM tbl_student WHERE email = ?");
         $stmt_check_email->bind_param("s", $email);
@@ -27,26 +41,152 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_student'])) {
         $stmt_check_email->store_result();
 
         if ($stmt_check_email->num_rows > 0) {
-            $registrationError = "Email already registered.";
+            $registrationError = "❌ Email already registered.";
         } else {
-            // Insert into tbl_student
-            $stmt = $conn->prepare("INSERT INTO tbl_student (student_name, dept_id, program_id, gender, email, stu_phn, password) VALUES (?, ?, ?, ?, ?, ?, ?)");
-            $stmt->bind_param("siissss", $student_name, $dept_id, $program_id, $gender, $email, $stu_phn, $hashed_password);
+            // Generate OTP
+            $otp = rand(100000, 999999);
+            $_SESSION['registration_otp'] = $otp;
+            $_SESSION['registration_data'] = [
+                'student_name' => $student_name,
+                'email' => $email,
+                'stu_phn' => $stu_phn,
+                'password' => $password,
+                'dept_id' => $dept_id,
+                'program_id' => $program_id,
+                'gender' => $gender
+            ];
 
-            if ($stmt->execute()) {
-                $registrationSuccess = "Registration successful! You can now login.";
-                // Clear form fields after successful registration
-                $_POST = array(); // Clear all POST data
-            } else {
-                $registrationError = "Error during registration: " . $stmt->error;
+            // Send OTP via email
+            $mail = new PHPMailer(true);
+            try {
+                $mail->isSMTP();
+                $mail->Host       = 'smtp.gmail.com';
+                $mail->SMTPAuth   = true;
+                $mail->Username   = 'magazineoperator@gmail.com'; // your Gmail
+                $mail->Password   = 'rxaosvryejbydanp'; // Gmail App password
+                $mail->SMTPSecure = PHPMailer::ENCRYPTION_SMTPS;
+                $mail->Port       = 465;
+
+                $mail->setFrom('your-email@gmail.com', 'Online Magazine Portal');
+                $mail->addAddress($email);
+
+                $mail->isHTML(true);
+                $mail->Subject = 'Your OTP for Registration';
+                $mail->Body    = '<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Your OTP Code</title>
+<style>
+    body {
+        margin: 0;
+        padding: 0;
+        font-family: Arial, sans-serif;
+        background: linear-gradient(135deg, #ff512f 0%, #dd2476 100%);
+    }
+    .container {
+        max-width: 600px;
+        margin: 40px auto;
+        background: #fff;
+        border-radius: 15px;
+        box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+        padding: 30px;
+        text-align: center;
+    }
+    h1 {
+        font-size: 26px;
+        color: #dd2476;
+        margin-bottom: 20px;
+        animation: fadeInDown 1s ease-in-out;
+    }
+    p {
+        font-size: 16px;
+        color: #444;
+        line-height: 1.5;
+        animation: fadeIn 1.5s ease-in-out;
+    }
+    .otp {
+        font-size: 32px;
+        font-weight: bold;
+        color: #ff512f;
+        margin: 20px 0;
+        padding: 12px 25px;
+        border: 2px dashed #dd2476;
+        border-radius: 10px;
+        display: inline-block;
+        animation: pulse 1.5s infinite;
+    }
+    @keyframes fadeInDown {
+        from {opacity: 0; transform: translateY(-30px);}
+        to {opacity: 1; transform: translateY(0);}
+    }
+    @keyframes fadeIn {
+        from {opacity: 0;}
+        to {opacity: 1;}
+    }
+    @keyframes pulse {
+        0% {transform: scale(1);}
+        50% {transform: scale(1.08);}
+        100% {transform: scale(1);}
+    }
+    .footer {
+        margin-top: 25px;
+        font-size: 14px;
+        color: #888;
+    }
+</style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Secure Verification</h1>
+        <p>Use the following One-Time Password (OTP) to complete your login/verification:</p>
+        <div class="otp">' . $otp . '</div>
+        <p>This code will expire in <strong>5 minutes</strong>. Please do not share it with anyone.</p>
+        <div class="footer">© ' . date("Y") . ' Online Magazine. All rights reserved.</div>
+    </div>
+</body>
+</html>';
+                $mail->AltBody = "Your One-Time Password (OTP) is: $otp";
+
+                $mail->send();
+                $show_otp_modal = true;
+            } catch (Exception $e) {
+                $registrationError = "❌ OTP could not be sent. Error: {$mail->ErrorInfo}";
             }
-            $stmt->close();
         }
         $stmt_check_email->close();
     }
 }
 
-// Fetch departments and programs for dropdowns
+// STEP 2: OTP Verification
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['otp_submit'])) {
+    $submitted_otp = $_POST['otp'];
+
+    if (isset($_SESSION['registration_otp']) && $submitted_otp == $_SESSION['registration_otp']) {
+        $data = $_SESSION['registration_data'];
+
+        // Hash password
+        $hashed_password = password_hash($data['password'], PASSWORD_DEFAULT);
+
+        // Insert into database
+        $stmt = $conn->prepare("INSERT INTO tbl_student (student_name, dept_id, program_id, gender, email, stu_phn, password) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        $stmt->bind_param("siissss", $data['student_name'], $data['dept_id'], $data['program_id'], $data['gender'], $data['email'], $data['stu_phn'], $hashed_password);
+
+        if ($stmt->execute()) {
+            $registrationSuccess = "✅ Registration successful! You can now login.";
+            unset($_SESSION['registration_otp']);
+            unset($_SESSION['registration_data']);
+        } else {
+            $registrationError = "❌ Registration failed: " . $stmt->error;
+        }
+        $stmt->close();
+    } else {
+        $registrationError = "❌ Invalid OTP. Please try again.";
+        $show_otp_modal = true;
+    }
+}
+
+// Fetch departments and programs (unchanged)
 $departments = [];
 $programs = [];
 
@@ -63,6 +203,7 @@ while ($row = $result_program->fetch_assoc()) {
 $conn->close();
 ?>
 
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -70,27 +211,93 @@ $conn->close();
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Student Registration</title>
     <style>
-        body { font-family: Arial, sans-serif; background-color: #f4f4f4; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
-        .registration-container { background-color: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); width: 450px; text-align: center; }
-        .registration-container h2 { margin-bottom: 20px; color: #333; }
+        body {
+            font-family: 'Roboto', Arial, sans-serif;
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background-image: url('21.png');
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+            position: relative;
+        }
+      
+        .registration-container {
+            position: relative;
+            z-index: 1;
+            width: 520px;
+            max-width: 92%;
+            padding: 30px;
+            text-align: center;
+            border-radius: 16px;
+            background: rgba(248, 249, 250, 0.14);
+            box-shadow: 0 20px 50px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.25);
+            backdrop-filter: blur(14px);
+            -webkit-backdrop-filter: blur(14px);
+            border: 1px solid rgba(255,255,255,0.28);
+            animation: fadeIn 0.9s ease-out, floatY 6s ease-in-out infinite;
+            transition: transform 0.25s ease, box-shadow 0.25s ease;
+        }
+        .registration-container::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            border-radius: 16px;
+            padding: 1px;
+            background: linear-gradient(135deg, rgba(0,191,165,0.55), rgba(255,140,66,0.45));
+            -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+            -webkit-mask-composite: xor;
+                    mask-composite: exclude;
+            pointer-events: none;
+        }
+        .registration-container:hover { transform: translateY(-4px) scale(1.01); box-shadow: 0 24px 60px rgba(0,0,0,0.3), 0 0 0 6px rgba(0,191,165,0.08); }
+        @keyframes floatY { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
+
+        .registration-container h2 { margin-bottom: 20px; color: var(--color-primary, #00BFA5); letter-spacing: 0.3px; }
         .form-group { margin-bottom: 15px; text-align: left; }
-        .form-group label { display: block; margin-bottom: 5px; color: #555; }
+        .form-group label { display: block; margin-bottom: 6px; color: var(--color-primary, #070707ff); font-weight: 500; }
         .form-group input[type="text"], .form-group input[type="email"], .form-group input[type="password"],
         .form-group select {
             width: calc(100% - 22px);
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
+            padding: 12px;
+            border: 1px solid rgba(0,0,0,0.12);
+            border-radius: 8px;
             box-sizing: border-box;
+            background: rgba(255, 255, 255, 1);
+            transition: border-color 0.3s ease, box-shadow 0.3s ease, background-color 0.3s ease;
         }
-        .form-group input[type="radio"] { margin-right: 5px; }
-        .btn-register { background-color: #28a745; color: white; padding: 12px 20px; border: none; border-radius: 4px; cursor: pointer; width: 100%; font-size: 16px; transition: background-color 0.3s ease; }
-        .btn-register:hover { background-color: #218838; }
-        .login-link { margin-top: 15px; font-size: 14px; }
-        .login-link a { color: #007bff; text-decoration: none; }
-        .login-link a:hover { text-decoration: underline; }
-        .error { color: red; margin-bottom: 15px; }
-        .success { color: green; margin-bottom: 15px; }
+        .form-group input[type="text"]:focus, .form-group input[type="email"]:focus, .form-group input[type="password"]:focus,
+        .form-group select:focus { border-color: var(--color-primary, #00BFA5); box-shadow: 0 0 0 4px rgba(0,191,165,0.18); background: rgba(255,255,255,0.7); outline: none; }
+        .form-group input[type="radio"] { margin-right: 6px; }
+
+        .btn-register {
+            background: linear-gradient(45deg, var(--color-primary-2, #33CDB9), var(--color-primary, #00BFA5));
+            color: #fff;
+            padding: 12px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            width: 100%;
+            font-size: 16px;
+            font-weight: 700;
+            box-shadow: 0 10px 24px rgba(0,191,165,0.25);
+            transition: background-color 0.3s ease, transform 0.2s ease, box-shadow 0.2s ease, filter 0.2s ease;
+        }
+        .btn-register:hover { background: linear-gradient(45deg, var(--color-primary, #00BFA5), var(--color-primary-3, #009985)); transform: translateY(-2px); box-shadow: 0 16px 34px rgba(0,191,165,0.35); filter: brightness(1.03); }
+        .btn-register:active { transform: translateY(0); box-shadow: 0 8px 18px rgba(0,191,165,0.25); }
+
+        .login-link { margin-top: 15px; font-size: 14px; color: var(--color-muted, #4B5C66); }
+        .login-link a { color: var(--color-primary, #00BFA5); text-decoration: none; font-weight: 500; transition: color 0.3s ease; }
+        .login-link a:hover { color: var(--color-primary-3, #009985); text-decoration: underline; }
+
+        .error { color: #C0392B; margin-bottom: 15px; }
+        .success { color: var(--color-primary-3, #009985); margin-bottom: 15px; }
+
+        @media (max-width: 768px) { .registration-container { width: 94%; padding: 26px; } }
     </style>
 </head>
 <body>
@@ -158,6 +365,25 @@ $conn->close();
             </div>
             <button type="submit" name="register_student" class="btn-register">Register</button>
         </form>
+<div id="otpModal" class="modal">
+    <div class="modal-content">
+        <div class="modal-right">
+            <h3>Verify Your Email</h3>
+            <p>We've sent a 6-digit OTP to your email address. Please enter it below.</p>
+            <div id="otpMessage">
+              <?php if (!empty($register_message) && $show_otp_modal): ?>
+                  <div class="message <?= $register_message_type; ?>">
+                      <?= $register_message ?>
+                  </div>
+              <?php endif; ?>
+            </div>
+            <form method="POST">
+                <input type="tel" name="otp" placeholder="Enter 6-Digit OTP" maxlength="6" required>
+                <button type="submit" name="otp_submit">Verify & Complete Registration</button>
+            </form>
+        </div>
+    </div>
+</div>
         <div class="login-link">
             Already have an account? <a href="index.php">Login Here</a>
         </div>
@@ -186,6 +412,30 @@ $conn->close();
             // Initial filter when page loads, useful if there's a pre-selected department
             filterPrograms();
         });
+
+        const otpModal = document.getElementById("otpModal");
+
+        function closeAllModals() {
+        loginModal.style.display = "none";
+        registerModal.style.display = "none";
+        if (otpModal) otpModal.style.display = "none";
+    }
+    
+    // Auto-open OTP modal if PHP flag is set
+    <?php if ($show_otp_modal): ?>
+    document.addEventListener('DOMContentLoaded', function() {
+        closeAllModals();
+        otpModal.style.display = "flex";
+    });
+    <?php endif; ?>
+
+    // Auto-open register modal if there's a registration error (but not an OTP error)
+    <?php if (!empty($register_message) && !$show_otp_modal): ?>
+    document.addEventListener('DOMContentLoaded', function() {
+        openRegisterModal();
+    });
+    <?php endif; ?>
+
     </script>
 </body>
 </html>

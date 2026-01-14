@@ -1,0 +1,1299 @@
+<?php
+// student_dashboard.php
+// Ensure session is started only once at the very top
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+// Include database connection
+include 'db_connect.php';
+
+// Check if user is logged in and is a student
+if (!isset($_SESSION['user_id']) || $_SESSION['usertype'] !== 'student') {
+    header("Location: index.php");
+    exit();
+}
+
+$student_id = $_SESSION['user_id'];
+$successMessage = '';
+$errorMessage = '';
+
+// Fetch student details (optional, for display)
+$student_details = null;
+$stmt_student = $conn->prepare("SELECT student_name, email, stu_phn, gender, dept_name, program_name FROM tbl_student ts JOIN tbl_department td ON ts.dept_id = td.dept_id JOIN tbl_program tp ON ts.program_id = tp.program_id WHERE student_id = ?");
+$stmt_student->bind_param("i", $student_id);
+$stmt_student->execute();
+$result_student = $stmt_student->get_result();
+if ($result_student->num_rows == 1) {
+    $student_details = $result_student->fetch_assoc();
+}
+$stmt_student->close();
+
+// --- Fetch All Published Content with Upvote and Comment Counts ---
+// We fetch all content initially, then sort client-side.
+$published_content_raw = [];
+$stmt_published = $conn->prepare("
+    SELECT
+        tc.content_id,
+        tc.title,
+        tc.contentbody,
+        tc.file_path,
+        tc.submitted_date,
+        tc.published_at,
+        -- Get total upvotes for this content
+        (SELECT COUNT(tf_up.feedback_id) FROM tbl_feedback tf_up WHERE tf_up.content_id = tc.content_id AND tf_up.upvoted = 1) AS upvotes,
+        -- Get total comments for this content
+        (SELECT COUNT(tf_com.feedback_id) FROM tbl_feedback tf_com WHERE tf_com.content_id = tc.content_id AND tf_com.comment IS NOT NULL AND tf_com.comment != '') AS comments_count,
+        -- Check if the current user has upvoted this content
+        (SELECT MAX(tf_my_up.upvoted) FROM tbl_feedback tf_my_up WHERE tf_my_up.content_id = tc.content_id AND tf_my_up.student_id = ?) AS my_upvote_status,
+        ts.student_name,
+        tct.type_name AS content_type,
+        tcat.description AS category_description,
+        tcat.category_name AS category_name_raw,
+        tcat.rules AS category_rules
+    FROM tbl_content tc
+    JOIN tbl_content_approval tca ON tc.content_id = tca.content_id
+    JOIN tbl_student ts ON tc.student_id = ts.student_id
+    JOIN tbl_content_type tct ON tc.type_id = tct.type_id
+    JOIN tbl_content_category tcat ON tc.category_id = tcat.category_id
+    WHERE tc.published_at IS NOT NULL AND tca.status = 'approved'
+    ORDER BY tc.published_at DESC
+"); // Default order by latest for initial load
+$stmt_published->bind_param("i", $student_id); // Only one binding needed for the single '?' placeholder in my_upvote_status subquery
+$stmt_published->execute();
+$result_published = $stmt_published->get_result();
+while ($row = $result_published->fetch_assoc()) {
+    $published_content_raw[] = $row;
+}
+$stmt_published->close();
+
+$conn->close();
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Student Magazine Portal</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=Roboto:wght@300;400;700&display=swap&family=Georgia&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
+    <style>
+        /* NEW CSS FOR MAGAZINE LAYOUT AND COLORS */
+        body {
+            overflow: hidden; /* Prevent scrolling on initial load */
+        }
+        .dashboard-container {
+            min-height: 100vh;
+            display: flex;
+            background-color: #f0f2f5;
+        }
+
+        .main-content {
+            flex-grow: 1; /* Allow main-content to take all available space */
+            padding: 0; /* Remove padding from main-content itself */
+            margin: 0; /* Remove margin from main-content to fit fully */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden; /* Hide overflow for animations */
+            position: relative;
+            background-color: transparent; /* Main content background will be handled by sub-containers */
+            box-shadow: none; /* Remove default shadow */
+        }
+
+        /* Magazine Cover Container - now fills main-content area but its content (the cover) is smaller */
+        .magazine-cover-container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            position: absolute; /* Positioned relative to .main-content */
+            top: 0;
+            left: 0;
+            transform-origin: left center;
+            transition: transform 1s ease-in-out, opacity 1s ease-in-out;
+            perspective: 1500px; /* For 3D flip effect */
+            background: transparent; /* Ensures no background color is applied behind the cover */
+            box-sizing: border-box; /* Include padding in width/height calculation */
+        }
+
+        .magazine-cover {
+            width: 80%; /* Adjusted to be a percentage of its container */
+            max-width: 650px; /* Max width for consistency */
+            height: 90%; /* Adjusted to be a percentage of its container */
+            max-height: 850px; /* Max height for consistency */
+            position: relative; /* Needed for positioning video and overlay */
+            overflow: hidden; /* Hide video overflow */
+            border-radius: 15px; /* More rounded corners */
+            box-shadow: 0 25px 60px rgba(0, 0, 0, 0.5); /* Stronger shadow */
+            display: flex; /* Flexbox for centering overlay content */
+            flex-direction: column;
+            justify-content: flex-end; /* Align overlay content to bottom */
+            text-align: center;
+            color: white;
+            cursor: pointer;
+            transition: transform 0.5s ease-in-out, box-shadow 0.3s ease;
+            border: 5px solid rgba(255,255,255,0.3); /* Subtle white border */
+            /* No background-image or background-color here, as video will cover it */
+        }
+
+        /* Video styling for the cover */
+        .magazine-cover video {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover; /* Ensures the video covers the entire element */
+            z-index: 1; /* Place video behind overlay */
+            filter: saturate(1.2) brightness(0.8); /* Slightly desaturate and darken video for text readability */
+        }
+
+        .magazine-cover:hover {
+            transform: scale(1.01); /* Slight zoom on hover */
+            box-shadow: 0 30px 70px rgba(0, 0, 0, 0.6); /* Even stronger shadow on hover */
+        }
+
+        .cover-overlay {
+            background: linear-gradient(to top, rgba(0,0,0,0.8) 0%, rgba(0,0,0,0) 60%); /* Darker gradient */
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            align-items: center;
+            padding-bottom: 40px; /* Adjust padding */
+            z-index: 2; /* Place overlay above video */
+        }
+
+        .magazine-cover h1 {
+            font-family: 'Playfair Display', serif;
+            font-size: 4em; /* Larger title */
+            color: #fff;
+            margin-bottom: 15px;
+            line-height: 1.1;
+            text-shadow: 3px 3px 8px rgba(0,0,0,0.9); /* Stronger text shadow */
+            letter-spacing: 2px; /* More spacing */
+            border-bottom: none;
+            padding-bottom: 0;
+            animation: fadeInText 1.5s ease-out; /* Add animation */
+        }
+
+        .magazine-cover p {
+            font-family: 'Roboto', sans-serif;
+            font-size: 1.5em; /* Larger tagline */
+            margin-bottom: 30px;
+            color: #f0f0f0;
+            text-shadow: 2px 2px 5px rgba(0,0,0,0.7);
+            animation: fadeInText 1.5s ease-out 0.5s forwards; /* Add animation with delay */
+            opacity: 0; /* Start invisible for animation */
+        }
+
+        @keyframes fadeInText {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .open-magazine-btn {
+            background-color: #FFC300; /* Vibrant yellow */
+            color: #333; /* Dark text for contrast */
+            padding: 18px 35px; /* Larger button */
+            border: none;
+            border-radius: 50px;
+            font-size: 1.3em; /* Larger font */
+            font-weight: bold;
+            cursor: pointer;
+            transition: background-color 0.3s ease, transform 0.3s ease, box-shadow 0.3s ease;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.4);
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        .open-magazine-btn:hover {
+            background-color: #FFD700; /* Lighter yellow on hover */
+            transform: translateY(-5px) scale(1.02);
+            box-shadow: 0 12px 25px rgba(0,0,0,0.5);
+        }
+
+        /* Cover Open Animation */
+        .magazine-cover-container.open {
+            transform: rotateY(-90deg) scale(0.8); /* More pronounced flip and shrink */
+            opacity: 0;
+            pointer-events: none; /* Disable interaction during transition */
+        }
+
+        /* Magazine Reader (Content Display) */
+        .magazine-reader-container {
+            width: 95%; /* Adjusted to be slightly smaller than full width */
+            height: 95%; /* Adjusted to be slightly smaller than full height */
+            background-color: #fff;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            padding: 40px; /* Increased padding for more magazine-like appearance */
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto; /* Allow scrolling for content */
+            opacity: 0; /* Initially hidden */
+            transform: translateY(20px); /* Slide up effect */
+            transition: opacity 0.7s ease-in-out 0.5s, transform 0.7s ease-in-out 0.5s; /* Delay transition */
+        }
+
+        .magazine-reader-container.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .reader-controls {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 15px;
+            background-color: #f8f8f8;
+            padding: 15px 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        }
+
+        .nav-btn {
+            background-color: #4CAF50; /* Green for navigation */
+            color: white;
+            padding: 12px 25px;
+            border-radius: 30px;
+            border: none;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background-color 0.3s ease, transform 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 1em;
+            text-transform: uppercase;
+        }
+        .nav-btn:hover {
+            background-color: #45a049;
+            transform: translateY(-3px);
+        }
+        .nav-btn:disabled {
+            background-color: #a5d6a7; /* Lighter green when disabled */
+            cursor: not-allowed;
+        }
+
+        .sort-options {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .sort-options span {
+            font-weight: bold;
+            color: #555;
+        }
+
+        .btn-sort {
+            background-color: #FF8C00; /* Orange for sort buttons */
+            color: white;
+            padding: 10px 20px;
+            border-radius: 20px;
+            text-decoration: none;
+            font-weight: 600;
+            transition: background-color 0.3s ease, transform 0.2s ease;
+            border: none;
+        }
+        .btn-sort:hover {
+            background-color: #E68A00;
+            transform: translateY(-2px);
+        }
+        .btn-sort.active {
+            background-color: #8A2BE2; /* BlueViolet when active */
+            color: white;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+
+        .current-content-display {
+            flex-grow: 1;
+            padding: 0; /* Removed padding here, handled by .magazine-reader-container */
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: left;
+            overflow: hidden; /* Hide overflow during animation */
+            position: relative; /* For absolute positioning of animating pages */
+            perspective: 1500px; /* Enhanced perspective for 3D page turn */
+            transform-style: preserve-3d; /* Ensure children maintain 3D space */
+        }
+
+        /* Style for individual content item within the reader */
+        .magazine-page-content {
+            background-color: #fefefe;
+            border-radius: 12px; /* Slightly more rounded */
+            padding: 30px; /* Inner padding for content */
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.1);
+            width: 90%; /* Take up more width */
+            max-width: 1000px; /* Set a reasonable max-width for magazine content */
+            margin: 0; /* No auto margin, as it's absolutely positioned within its container for animation */
+            position: absolute; /* Position for animation */
+            top: 0;
+            left: 50%; /* Center horizontally */
+            transform: translateX(-50%); /* Adjust for centering */
+            height: 100%;
+            box-sizing: border-box;
+            overflow-y: auto; /* Allow content to scroll */
+            backface-visibility: hidden; /* Hide backface during rotation */
+            /* Default transform-origin is center center, will be overridden by animation classes */
+        }
+
+        /* Page Transition Animations for Book Turn */
+        /* Outgoing page (Next): Rotates from right to left */
+        @keyframes pageTurnOutNext {
+            0% { transform: translateX(-50%) rotateY(0deg); opacity: 1; }
+            100% { transform: translateX(-150%) rotateY(-90deg); opacity: 0; }
+        }
+
+        /* Incoming page (Next): Appears from right, rotates into place */
+        @keyframes pageTurnInNext {
+            0% { transform: translateX(50%) rotateY(90deg); opacity: 0; }
+            100% { transform: translateX(-50%) rotateY(0deg); opacity: 1; }
+        }
+
+        /* Outgoing page (Previous): Rotates from left to right */
+        @keyframes pageTurnOutPrev {
+            0% { transform: translateX(-50%) rotateY(0deg); opacity: 1; }
+            100% { transform: translateX(50%) rotateY(90deg); opacity: 0; }
+        }
+
+        /* Incoming page (Previous): Appears from left, rotates into place */
+        @keyframes pageTurnInPrev {
+            0% { transform: translateX(-150%) rotateY(-90deg); opacity: 0; }
+            100% { transform: translateX(-50%) rotateY(0deg); opacity: 1; }
+        }
+
+        .magazine-page-content.slide-out-left {
+            animation: pageTurnOutNext 0.7s ease-in-out forwards;
+            transform-origin: right center; /* Page pivots from the right edge */
+        }
+        .magazine-page-content.slide-in-right {
+            animation: pageTurnInNext 0.7s ease-in-out forwards;
+            transform-origin: right center; /* New page pivots from its right edge as it comes in */
+        }
+        .magazine-page-content.slide-out-right {
+            animation: pageTurnOutPrev 0.7s ease-in-out forwards;
+            transform-origin: left center; /* Page pivots from the left edge */
+        }
+        .magazine-page-content.slide-in-left {
+            animation: pageTurnInPrev 0.7s ease-in-out forwards;
+            transform-origin: left center; /* New page pivots from its left edge as it comes in */
+        }
+
+
+        .magazine-page-content h2 {
+            font-family: 'Playfair Display', serif;
+            font-size: 2.8em;
+            color: #2c3e50;
+            margin-bottom: 15px;
+            line-height: 1.2;
+            text-align: center;
+            border-bottom: 3px solid #f0f0f0; /* Thicker, softer border */
+            padding-bottom: 15px;
+        }
+        .magazine-page-content .author-info {
+            font-size: 1.1em;
+            color: #7f8c8d;
+            text-align: center;
+            margin-bottom: 25px;
+            font-style: italic;
+        }
+        .magazine-page-content .content-media {
+            max-width: 100%;
+            height: auto;
+            display: block;
+            margin: 25px auto;
+            border-radius: 10px;
+            box-shadow: 0 6px 15px rgba(0,0,0,0.15);
+        }
+        .magazine-page-content .content-text {
+            font-family: 'Georgia', serif;
+            font-size: 1.2em; /* Slightly larger text */
+            line-height: 1.8; /* More comfortable line height */
+            color: #333;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            text-align: justify;
+        }
+
+        /* Upvote/Comment Action bar for single content view */
+        .magazine-page-content .content-actions-bar {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            margin-top: 40px;
+            padding-top: 25px;
+            border-top: 1px dashed #ddd; /* Clearer separator */
+        }
+
+        /* Comments Section (re-styled for in-page) */
+        .comments-section {
+            margin-top: 40px; /* More space */
+            padding: 25px;
+            border: 1px solid #e0e0e0;
+            border-radius: 10px;
+            background-color: #fdfdfd; /* Lighter background */
+            width: 100%;
+            max-width: 700px;
+            margin-left: auto;
+            margin-right: auto;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+        }
+        .comments-section h4 {
+            font-size: 1.4em;
+            color: #2c3e50;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 10px;
+        }
+        .comments-list {
+            max-height: 350px; /* Make comments list scrollable */
+            overflow-y: auto;
+            padding-right: 15px; /* Space for scrollbar */
+            margin-bottom: 25px;
+        }
+        .comment-item {
+            border-bottom: 1px dashed #e9e9e9; /* Lighter dashed line */
+            padding: 12px 0;
+            font-size: 1em;
+            color: #555;
+            position: relative;
+            transition: background-color 0.2s ease;
+        }
+        .comment-item:hover {
+            background-color: #f5f5f5; /* Subtle hover for comments */
+        }
+        .comment-item:last-child {
+            border-bottom: none;
+        }
+        .comment-author {
+            font-weight: bold;
+            color: #333;
+        }
+        .comment-date {
+            font-size: 0.8em;
+            color: #888;
+            margin-left: 10px;
+        }
+        .comment-text-display {
+            margin-top: 8px;
+            line-height: 1.5;
+        }
+        .comment-actions {
+            position: absolute;
+            top: 12px;
+            right: 0;
+            display: none;
+            gap: 8px;
+        }
+        .comment-item:hover .comment-actions {
+            display: flex;
+        }
+        .comment-actions button {
+            background: none;
+            border: none;
+            color: #666;
+            cursor: pointer;
+            font-size: 1em;
+            padding: 5px;
+            border-radius: 5px;
+            transition: color 0.2s ease, background-color 0.2s ease;
+        }
+        .comment-actions button:hover {
+            background-color: #e0e0e0;
+            color: #222;
+        }
+        .comment-actions .delete-comment-btn {
+            color: #dc3545;
+        }
+        .comment-actions .delete-comment-btn:hover {
+            background-color: #fadde1;
+            color: #a71d2a;
+        }
+
+        .add-comment-form {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            padding-top: 15px;
+            border-top: 1px solid #eee;
+        }
+        .add-comment-form textarea {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #bbb;
+            border-radius: 8px;
+            resize: vertical;
+            min-height: 70px;
+            font-size: 1em;
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.05);
+        }
+        .add-comment-form textarea:focus {
+            border-color: #3498db;
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.08), 0 0 5px rgba(52, 152, 219, 0.5);
+            outline: none;
+        }
+        .add-comment-form button {
+            align-self: flex-end;
+            padding: 10px 25px;
+            font-size: 1.1em;
+            border-radius: 25px;
+            background-color: #3498db; /* Blue for post button */
+            color: white;
+            transition: background-color 0.3s ease, transform 0.2s ease;
+        }
+        .add-comment-form button:hover {
+            background-color: #2980b9;
+            transform: translateY(-2px);
+        }
+
+        /* Responsive adjustments */
+        @media (max-width: 768px) {
+            .magazine-cover {
+                width: 95%;
+                height: 85%;
+                padding: 20px;
+                border-radius: 10px;
+            }
+            .magazine-cover h1 {
+                font-size: 2.8em;
+            }
+            .magazine-cover p {
+                font-size: 1.1em;
+            }
+            .open-magazine-btn {
+                padding: 10px 20px;
+                font-size: 1em;
+            }
+            .magazine-reader-container {
+                padding: 15px;
+                border-radius: 0;
+            }
+            .reader-controls {
+                flex-direction: column;
+                gap: 10px;
+            }
+            .nav-btn, .btn-sort {
+                width: 100%;
+                font-size: 0.9em;
+            }
+            .sort-options {
+                width: 100%;
+                justify-content: center;
+                flex-wrap: wrap;
+                font-size: 0.9em;
+            }
+            .magazine-page-content h2 {
+                font-size: 2em;
+            }
+            .magazine-page-content .content-text {
+                font-size: 1em;
+            }
+            .comments-section {
+                padding: 15px;
+            }
+            .comments-section h4 {
+                font-size: 1.2em;
+            }
+            .add-comment-form button {
+                padding: 8px 20px;
+                font-size: 0.9em;
+            }
+        }
+    </style>
+</head>
+<body>
+    <?php include 'includes/header.php'; ?>
+
+    <div class="dashboard-container">
+        <?php include 'includes/sidebar.php'; ?>
+        <div class="main-content">
+            <div id="magazineCoverContainer" class="magazine-cover-container">
+                <div class="magazine-cover">
+                    <!-- Embedded video for the magazine cover -->
+                    <video autoplay loop muted playsinline poster="https://placehold.co/650x850/cccccc/333333?text=Magazine%20Cover">
+                        <source src="images/Untitled design.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                    <div class="cover-overlay">
+                        <h1>The Creative Voices Magazine 2025</h1>
+                        <p>Click to open and explore a world of creativity from our students!</p>
+                        <button class="open-magazine-btn">Explore</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="magazineReaderContainer" class="magazine-reader-container" style="display: none;">
+                <div class="reader-controls">
+                    <button id="prevContentBtn" class="nav-btn">&laquo; Previous</button>
+                    <div class="sort-options">
+                        <span>Sort by:</span>
+                        <button id="sortLatestBtn" class="btn-sort active">Latest</button>
+                        <button id="sortUpvotesBtn" class="btn-sort">Most Upvoted</button>
+                    </div>
+                    <button id="nextContentBtn" class="nav-btn">Next &raquo;</button>
+                </div>
+                <div id="currentContentDisplay" class="current-content-display">
+                    <!-- Content will be dynamically loaded here by JavaScript -->
+                    <p class="no-content-message" style="display: none;">No content to display in the magazine yet.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal for Full Content View (still used for competition details/fallback) -->
+    <div id="fullContentModal" class="modal">
+        <div class="modal-content magazine-style">
+            <span class="close-button">&times;</span>
+            <div class="magazine-header">
+                <h2 id="modalTitle" class="magazine-title"></h2>
+                <p id="modalAuthor" class="magazine-author"></p>
+            </div>
+            <div id="modalContentBody" class="modal-body magazine-body">
+                <p class="debug-info">Content Type: <span id="debugContentType"></span> | Category: <span id="debugCategoryName"></span></p>
+                <div class="loading-spinner" style="display: none; text-align: center; padding: 20px;">
+                    <i class="fas fa-spinner fa-spin fa-3x" style="color: #4a90e2;"></i>
+                    <p>Loading content...</p>
+                </div>
+                <!-- Content will be dynamically loaded here -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const currentStudentId = <?php echo json_encode($student_id); ?>;
+            let allPublishedContent = <?php echo json_encode($published_content_raw); ?>;
+            let displayedContent = [...allPublishedContent];
+            let currentPageIndex = 0;
+
+            const magazineCoverContainer = document.getElementById('magazineCoverContainer');
+            const openMagazineBtn = document.querySelector('.open-magazine-btn');
+            const magazineReaderContainer = document.getElementById('magazineReaderContainer');
+            const prevContentBtn = document.getElementById('prevContentBtn');
+            const nextContentBtn = document.getElementById('nextContentBtn');
+            const sortLatestBtn = document.getElementById('sortLatestBtn');
+            const sortUpvotesBtn = document.getElementById('sortUpvotesBtn');
+            const currentContentDisplay = document.getElementById('currentContentDisplay');
+            const noContentMessage = currentContentDisplay.querySelector('.no-content-message');
+
+            const fullContentModal = document.getElementById("fullContentModal");
+            const fullContentModalCloseButton = fullContentModal.querySelector(".close-button");
+            const modalTitle = fullContentModal.querySelector("#modalTitle");
+            const modalAuthor = fullContentModal.querySelector("#modalAuthor");
+            const modalContentBody = fullContentModal.querySelector("#modalContentBody");
+            const loadingSpinner = fullContentModal.querySelector(".loading-spinner");
+
+            function htmlspecialchars(str) {
+                const div = document.createElement('div');
+                div.appendChild(document.createTextNode(str));
+                return div.innerHTML;
+            }
+
+            // Function to render content HTML
+            function renderContentHtml(content) {
+                let contentHtml = '';
+                contentHtml += `
+                    <div class="magazine-page-content" data-content-id="${content.content_id}" data-my-upvote="${content.my_upvote_status}">
+                        <h2>${htmlspecialchars(content.title)}</h2>
+                        <p class="author-info">By ${htmlspecialchars(content.student_name)} | Published: ${new Date(content.published_at).toLocaleDateString()}</p>
+                `;
+
+                if (content.file_path) {
+                    const file_ext = content.file_path.split('.').pop().toLowerCase();
+                    if (['jpg', 'jpeg', 'png', 'gif'].includes(file_ext)) {
+                        contentHtml += `<img src="${htmlspecialchars(content.file_path)}" alt="${htmlspecialchars(content.title)}" class="content-media">`;
+                    } else if (['mp4', 'webm', 'ogg'].includes(file_ext)) {
+                        contentHtml += `
+                            <video controls class="content-media">
+                                <source src="${htmlspecialchars(content.file_path)}" type="video/${file_ext}">
+                                Your browser does not support the video tag.
+                            </video>
+                        `;
+                    } else {
+                        contentHtml += `<p class="content-text">Cannot display this content type directly.</p><a href="${htmlspecialchars(content.file_path)}" target="_blank" class="btn btn-primary">Download File</a>`;
+                    }
+                } else {
+                    const cleanContentBody = htmlspecialchars(content.contentbody.replace(/\\r\\n|\\n|\\r/g, '\n'));
+                    contentHtml += `<p class="content-text">${cleanContentBody}</p>`;
+                }
+
+                if (content.category_name_raw && content.category_name_raw.toLowerCase() === 'competition') {
+                    contentHtml += `<div class="magazine-competition-info">
+                        <h3>Competition Details:</h3>
+                        <p>${htmlspecialchars(content.category_description)}</p>`;
+                    if (content.category_rules) {
+                        contentHtml += `<h4 class="magazine-rules-heading">Rules:</h4><p class="magazine-rules-text">${htmlspecialchars(content.category_rules)}</p>`;
+                    }
+                    contentHtml += `</div>`;
+                }
+
+                contentHtml += `
+                    <div class="content-actions-bar">
+                        <button class="btn-action upvote-btn" data-content-id="${content.content_id}" data-my-upvote="${content.my_upvote_status}">
+                            <i class="fas fa-thumbs-up"></i> <span class="upvote-count">${htmlspecialchars(content.upvotes)}</span> Upvotes
+                        </button>
+                        <button class="btn-action comment-toggle-btn" data-content-id="${content.content_id}" data-student-id="${currentStudentId}">
+                            <i class="fas fa-comment"></i> <span class="comment-count">${htmlspecialchars(content.comments_count)}</span> Comments
+                        </button>
+                    </div>
+                    <div class="comments-section" style="display: none;" data-content-id="${content.content_id}">
+                        <h4>Comments</h4>
+                        <div class="comments-list">
+                            <p class="loading-comments" style="text-align: center; padding: 10px; display: none;">Loading comments...</p>
+                            <p class="no-comments" style="text-align: center; padding: 10px; display: none;">No comments yet.</p>
+                        </div>
+                        <form class="add-comment-form">
+                            <input type="hidden" name="content_id" value="${content.content_id}">
+                            <textarea name="comment_text" rows="2" placeholder="Add your comment..." required></textarea>
+                            <button type="submit" class="btn btn-primary">Post Comment</button>
+                        </form>
+                    </div>
+                </div>`;
+                return contentHtml;
+            }
+
+            function displayContentWithAnimation(index, direction) {
+                if (displayedContent.length === 0) {
+                    currentContentDisplay.innerHTML = '';
+                    noContentMessage.style.display = 'block';
+                    prevContentBtn.disabled = true;
+                    nextContentBtn.disabled = true;
+                    return;
+                } else {
+                    noContentMessage.style.display = 'none';
+                }
+
+                if (index < 0 || index >= displayedContent.length) {
+                    console.error("Content index out of bounds:", index);
+                    return;
+                }
+
+                const currentContentElement = currentContentDisplay.querySelector('.magazine-page-content');
+                const newContent = displayedContent[index];
+                const newContentHtml = renderContentHtml(newContent);
+
+                if (currentContentElement) {
+                    let animationOutClass = direction === 'next' ? 'slide-out-left' : 'slide-out-right';
+                    let animationInClass = direction === 'next' ? 'slide-in-right' : 'slide-in-left';
+
+                    // Temporarily disable buttons during animation
+                    prevContentBtn.disabled = true;
+                    nextContentBtn.disabled = true;
+                    sortLatestBtn.disabled = true;
+                    sortUpvotesBtn.disabled = true;
+
+                    currentContentElement.classList.add(animationOutClass);
+
+                    // Create new element and append it (it will be absolutely positioned)
+                    const tempDiv = document.createElement('div');
+                    tempDiv.innerHTML = newContentHtml;
+                    const newElement = tempDiv.firstElementChild; // Get the .magazine-page-content div
+                    newElement.classList.add(animationInClass); // Add the incoming animation class
+                    currentContentDisplay.appendChild(newElement);
+
+
+                    currentContentElement.addEventListener('animationend', function handler() {
+                        currentContentElement.removeEventListener('animationend', handler);
+                        currentContentElement.remove(); // Remove old element after its animation
+                    });
+                    
+                    newElement.addEventListener('animationend', function newHandler() {
+                        newElement.removeEventListener('animationend', newHandler);
+                        newElement.classList.remove(animationInClass); // Clean up incoming animation class
+                        
+                        // Re-enable buttons after animation
+                        prevContentBtn.disabled = index === 0;
+                        nextContentBtn.disabled = displayedContent.length === 0 ? true : index === displayedContent.length - 1; // Corrected check for next button
+                        sortLatestBtn.disabled = false;
+                        sortUpvotesBtn.disabled = false;
+
+                        attachDynamicEventListeners(); // Re-attach for new content
+                        applyUpvoteButtonState(); // Use existing function to apply state
+                    });
+                } else {
+                    // Initial load without animation (or if no current element)
+                    currentContentDisplay.innerHTML = newContentHtml;
+                    attachDynamicEventListeners();
+                    applyUpvoteButtonState(); // Use existing function to apply state
+                }
+
+                // Update navigation button states immediately for initial rendering only
+                if (!currentContentElement) {
+                    prevContentBtn.disabled = index === 0;
+                    nextContentBtn.disabled = displayedContent.length === 0 ? true : index === displayedContent.length - 1; // Corrected check for next button
+                }
+                currentPageIndex = index; // Update current page index
+            }
+
+
+            // Function to apply initial upvote button state based on `data-my-upvote`
+            function applyUpvoteButtonState() {
+                const upvoteBtn = currentContentDisplay.querySelector('.upvote-btn');
+                if (upvoteBtn) {
+                    const myUpvoteStatus = parseInt(upvoteBtn.getAttribute('data-my-upvote'));
+                    if (myUpvoteStatus === 1) {
+                        upvoteBtn.classList.add('upvoted');
+                    } else {
+                        upvoteBtn.classList.remove('upvoted');
+                    }
+                }
+            }
+
+
+            // Function to attach event listeners to dynamically loaded elements
+            function attachDynamicEventListeners() {
+                // Upvote button
+                const upvoteBtn = currentContentDisplay.querySelector('.upvote-btn');
+                if (upvoteBtn) {
+                    upvoteBtn.onclick = function() {
+                        const button = this; // Reference to the clicked button
+                        const contentId = button.getAttribute('data-content-id');
+                        const upvoteCountSpan = button.querySelector('.upvote-count');
+                        let currentUpvotes = parseInt(upvoteCountSpan.textContent);
+                        let myUpvoteStatus = parseInt(button.getAttribute('data-my-upvote')); // 0 or 1
+
+                        let newUpvoteStatus;
+                        if (myUpvoteStatus === 1) { // Currently upvoted, so un-upvote
+                            newUpvoteStatus = 0;
+                            currentUpvotes--;
+                            button.classList.remove('upvoted');
+                        } else { // Not upvoted, so upvote
+                            newUpvoteStatus = 1;
+                            currentUpvotes++;
+                            button.classList.add('upvoted');
+                        }
+                        upvoteCountSpan.textContent = currentUpvotes; // Optimistic UI update
+                        button.setAttribute('data-my-upvote', newUpvoteStatus); // Update status on button
+
+                        // Update the underlying data in displayedContent array
+                        const contentItem = displayedContent.find(c => c.content_id == contentId);
+                        if (contentItem) {
+                            contentItem.upvotes = currentUpvotes;
+                            contentItem.my_upvote_status = newUpvoteStatus;
+                        }
+                        
+                        // Use update_upvote.php
+                        fetch('update_upvote.php', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: `content_id=${contentId}&action=${newUpvoteStatus === 1 ? 'upvote' : 'unupvote'}`
+                        })
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.success) {
+                                // Ensure UI and data array reflect server's actual counts
+                                upvoteCountSpan.textContent = data.new_upvote_count;
+                                if (contentItem) {
+                                    contentItem.upvotes = data.new_upvote_count;
+                                    contentItem.comments_count = data.new_comments_count; // Update comments_count as well
+                                }
+                                // Update comment count on comment button in UI
+                                const commentButton = currentContentDisplay.querySelector(`.comment-toggle-btn[data-content-id="${contentId}"] .comment-count`);
+                                if (commentButton) {
+                                    commentButton.textContent = data.new_comments_count;
+                                }
+
+                                // Apply correct class based on server's final status
+                                if (newUpvoteStatus === 1) {
+                                    button.classList.add('upvoted');
+                                } else {
+                                    button.classList.remove('upvoted');
+                                }
+
+                            } else {
+                                alert(data.message || 'Error upvoting/un-upvoting content.');
+                                // Revert UI on error
+                                upvoteCountSpan.textContent = myUpvoteStatus === 1 ? currentUpvotes + 1 : currentUpvotes - 1;
+                                button.setAttribute('data-my-upvote', myUpvoteStatus);
+                                if (myUpvoteStatus === 1) {
+                                    button.classList.add('upvoted');
+                                } else {
+                                    button.classList.remove('upvoted');
+                                }
+                                if (contentItem) {
+                                    contentItem.upvotes = myUpvoteStatus === 1 ? contentItem.upvotes + 1 : contentItem.upvotes - 1;
+                                    contentItem.my_upvote_status = myUpvoteStatus;
+                                }
+                            }
+                        })
+                        .catch(error => {
+                            console.error('Fetch error:', error);
+                            alert('An error occurred during upvoting/un-upvoting: ' + error.message);
+                            // Revert UI on network error
+                            upvoteCountSpan.textContent = myUpvoteStatus === 1 ? currentUpvotes + 1 : currentUpvotes - 1;
+                            button.setAttribute('data-my-upvote', myUpvoteStatus);
+                            if (myUpvoteStatus === 1) {
+                                button.classList.add('upvoted');
+                            } else {
+                                button.classList.remove('upvoted');
+                            }
+                            if (contentItem) {
+                                contentItem.upvotes = myUpvoteStatus === 1 ? contentItem.upvotes + 1 : contentItem.upvotes - 1;
+                                contentItem.my_upvote_status = myUpvoteStatus;
+                            }
+                        });
+                    };
+                }
+
+                // Comment toggle button
+                const commentToggleButton = currentContentDisplay.querySelector('.comment-toggle-btn');
+                if (commentToggleButton) {
+                    commentToggleButton.onclick = function() {
+                        const contentId = this.getAttribute('data-content-id');
+                        const commentsSection = currentContentDisplay.querySelector(`.comments-section[data-content-id="${contentId}"]`);
+                        const commentsList = commentsSection.querySelector('.comments-list');
+                        const loadingComments = commentsSection.querySelector('.loading-comments');
+                        const noComments = commentsSection.querySelector('.no-comments');
+
+                        if (commentsSection.style.display === 'none') {
+                            commentsSection.style.display = 'block';
+                            loadingComments.style.display = 'block';
+                            commentsList.innerHTML = '';
+                            noComments.style.display = 'none';
+
+                            // MODIFIED: Use comments_api.php for fetching comments
+                            fetch('comments_api.php?action=get_comments&content_id=' + contentId)
+                                .then(response => {
+                                    if (!response.ok) {
+                                        throw new Error(`HTTP error! status: ${response.status}`);
+                                    }
+                                    return response.json();
+                                })
+                                .then(data => {
+                                    loadingComments.style.display = 'none';
+                                    if (data.success && data.comments.length > 0) {
+                                        commentsList.innerHTML = ''; // Clear loading message
+                                        data.comments.forEach(comment => {
+                                            const commentDiv = document.createElement('div');
+                                            commentDiv.classList.add('comment-item');
+                                            // Assign a data attribute for student_id to identify owner for edit/delete
+                                            commentDiv.setAttribute('data-student-id', comment.student_id); 
+                                            // Assuming feedback_id is returned from comments_api.php for delete/edit functionality
+                                            commentDiv.setAttribute('data-feedback-id', comment.feedback_id || ''); 
+
+                                            let actionsHtml = '';
+                                            // Check if the current comment belongs to the logged-in student
+                                            if (comment.student_id == currentStudentId) {
+                                                actionsHtml = `
+                                                    <div class="comment-actions">
+                                                        <button class="edit-comment-btn" title="Edit Comment"><i class="fas fa-edit"></i></button>
+                                                        <button class="delete-comment-btn" title="Delete Comment"><i class="fas fa-trash-alt"></i></button>
+                                                    </div>
+                                                `;
+                                            }
+                                            
+                                            commentDiv.innerHTML = `
+                                                <span class="comment-author">${htmlspecialchars(comment.student_name)}</span>
+                                                <span class="comment-date">${htmlspecialchars(new Date(comment.comment_date).toLocaleString())}</span>
+                                                ${actionsHtml}
+                                                <p class="comment-text-display">${htmlspecialchars(comment.comment_text)}</p>
+                                            `;
+                                            commentsList.appendChild(commentDiv);
+                                        });
+                                        noComments.style.display = 'none';
+                                        attachCommentActionListeners(contentId); // Attach listeners for the newly loaded comments
+                                    } else {
+                                        noComments.style.display = 'block';
+                                    }
+                                })
+                                .catch(error => {
+                                    console.error('Error fetching comments:', error);
+                                    loadingComments.style.display = 'none';
+                                    commentsList.innerHTML = '<p style="color: red;">Error loading comments: ' + error.message + '</p>';
+                                });
+                        } else {
+                            commentsSection.style.display = 'none';
+                        }
+                    };
+                }
+
+                // Add comment form
+                const addCommentForm = currentContentDisplay.querySelector('.add-comment-form');
+                if (addCommentForm) {
+                    addCommentForm.onsubmit = function(event) {
+                        event.preventDefault();
+                        const contentId = this.querySelector('input[name="content_id"]').value;
+                        const commentTextarea = this.querySelector('textarea[name="comment_text"]');
+                        const commentText = commentTextarea.value;
+                        const commentsList = this.closest('.comments-section').querySelector('.comments-list');
+                        const commentCountSpan = currentContentDisplay.querySelector(`.comment-toggle-btn[data-content-id="${contentId}"] .comment-count`);
+                        const noComments = this.closest('.comments-section').querySelector('.no-comments');
+
+                        if (commentText.trim() === '') {
+                            alert('Comment cannot be empty.');
+                            return;
+                        }
+
+                        // MODIFIED: Use comments_api.php for adding comments
+                        fetch('comments_api.php', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: 'action=add_comment&content_id=' + contentId + '&comment_text=' + encodeURIComponent(commentText)
+                        })
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.success) {
+                                // Add the new comment to the top of the list
+                                const commentDiv = document.createElement('div');
+                                commentDiv.classList.add('comment-item');
+                                commentDiv.setAttribute('data-student-id', currentStudentId); // currentStudentId is client-side
+                                commentDiv.setAttribute('data-feedback-id', data.feedback_id || ''); // Assuming feedback_id is returned
+                                // data.student_name and data.comment_date are returned by comments_api.php
+
+                                let actionsHtml = `
+                                    <div class="comment-actions">
+                                        <button class="edit-comment-btn" title="Edit Comment"><i class="fas fa-edit"></i></button>
+                                        <button class="delete-comment-btn" title="Delete Comment"><i class="fas fa-trash-alt"></i></button>
+                                    </div>
+                                `;
+                                commentDiv.innerHTML = `
+                                    <span class="comment-author">${htmlspecialchars(data.student_name)}</span>
+                                    <span class="comment-date">${htmlspecialchars(new Date(data.comment_date).toLocaleString())}</span>
+                                    ${actionsHtml}
+                                    <p class="comment-text-display">${htmlspecialchars(commentText)}</p>
+                                `;
+                                commentsList.prepend(commentDiv);
+                                attachCommentActionListeners(contentId); // Re-attach listeners for the new comment
+
+                                commentTextarea.value = ''; // Clear textarea
+                                commentCountSpan.textContent = data.new_comment_count; // Update count
+                                updateContentCounts(contentId, null, data.new_comment_count);
+                                noComments.style.display = 'none'; // Hide "No comments yet" if a comment is added
+                                commentsList.scrollTop = 0; // Scroll to top to see new comment
+                            } else {
+                                alert(data.message || 'Error posting comment.');
+                            }
+                        })
+                        .catch(error => {
+                            console.error('Error:', error);
+                            alert('An error occurred during commenting: ' + error.message);
+                        });
+                    };
+                }
+            }
+
+            // Function to attach edit/delete listeners for comments (called after comments load/add)
+            function attachCommentActionListeners(contentId) {
+                const commentsList = currentContentDisplay.querySelector(`.comments-section[data-content-id="${contentId}"] .comments-list`);
+                if (!commentsList) return;
+
+                // Edit button listener
+                commentsList.querySelectorAll('.edit-comment-btn').forEach(button => {
+                    // Remove existing listener to prevent duplicates
+                    button.removeEventListener('click', handleEditComment);
+                    button.addEventListener('click', handleEditComment);
+                });
+
+                // Delete button listener
+                commentsList.querySelectorAll('.delete-comment-btn').forEach(button => {
+                    // Remove existing listener to prevent duplicates
+                    button.removeEventListener('click', handleDeleteComment);
+                    button.addEventListener('click', handleDeleteComment);
+                });
+            }
+
+            function handleEditComment(event) {
+                const button = event.target.closest('button');
+                const commentItem = button.closest('.comment-item');
+                const feedbackId = commentItem.getAttribute('data-feedback-id');
+                const contentId = button.closest('.comments-section').getAttribute('data-content-id');
+                const commentTextDisplay = commentItem.querySelector('.comment-text-display');
+                const originalText = commentTextDisplay.textContent;
+
+                commentTextDisplay.style.display = 'none';
+                const textarea = document.createElement('textarea');
+                textarea.value = originalText;
+                textarea.rows = 3;
+                textarea.classList.add('comment-edit-textarea');
+                commentItem.insertBefore(textarea, commentTextDisplay.nextSibling);
+
+                const actionsDiv = commentItem.querySelector('.comment-actions');
+                actionsDiv.innerHTML = `
+                    <button class="save-comment-btn" title="Save Comment"><i class="fas fa-save"></i></button>
+                    <button class="cancel-edit-btn" title="Cancel Edit"><i class="fas fa-times"></i></button>
+                `;
+
+                // Re-attach listeners for newly created save/cancel buttons
+                commentItem.querySelector('.save-comment-btn').addEventListener('click', function() {
+                    const newCommentText = textarea.value;
+                    if (newCommentText.trim() === '') {
+                        alert('Comment cannot be empty.');
+                        return;
+                    }
+                    // MODIFIED: Use comments_api.php for editing
+                    fetch('comments_api.php', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: 'action=edit_comment&content_id=' + contentId + '&feedback_id=' + feedbackId + '&comment_text=' + encodeURIComponent(newCommentText)
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            commentTextDisplay.textContent = newCommentText;
+                            commentTextDisplay.style.display = 'block';
+                            textarea.remove();
+                            actionsDiv.innerHTML = `
+                                <button class="edit-comment-btn" title="Edit Comment"><i class="fas fa-edit"></i></button>
+                                <button class="delete-comment-btn" title="Delete Comment"><i class="fas fa-trash-alt"></i></button>
+                            `;
+                            attachCommentActionListeners(contentId); // Re-attach original listeners
+                        } else {
+                            alert(data.message || 'Error updating comment.');
+                        }
+                    })
+                    .catch(error => alert('An error occurred during comment update: ' + error.message));
+                });
+
+                commentItem.querySelector('.cancel-edit-btn').addEventListener('click', function() {
+                    commentTextDisplay.style.display = 'block';
+                    textarea.remove();
+                    actionsDiv.innerHTML = `
+                        <button class="edit-comment-btn" title="Edit Comment"><i class="fas fa-edit"></i></button>
+                        <button class="delete-comment-btn" title="Delete Comment"><i class="fas fa-trash-alt"></i></button>
+                    `;
+                    attachCommentActionListeners(contentId); // Re-attach original listeners
+                });
+            }
+
+            function handleDeleteComment(event) {
+                const button = event.target.closest('button');
+                const commentItem = button.closest('.comment-item');
+                const feedbackId = commentItem.getAttribute('data-feedback-id'); // Get feedback_id for deletion
+                const contentId = button.closest('.comments-section').getAttribute('data-content-id');
+                const commentCountSpan = currentContentDisplay.querySelector(`.comment-toggle-btn[data-content-id="${contentId}"] .comment-count`);
+                const noComments = commentItem.closest('.comments-section').querySelector('.no-comments');
+
+                if (confirm('Are you sure you want to delete your comment?')) {
+                    // MODIFIED: Use comments_api.php for deleting comments
+                    fetch('comments_api.php', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: 'action=delete_comment&content_id=' + contentId + '&feedback_id=' + feedbackId // Pass feedback_id
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            commentItem.remove(); // Remove comment from UI
+                            commentCountSpan.textContent = data.new_comment_count; // Update count
+                            updateContentCounts(contentId, null, data.new_comment_count);
+                            if (data.new_comment_count == 0) {
+                                noComments.style.display = 'block';
+                            }
+                        } else {
+                            alert(data.message || 'Error deleting comment.');
+                        }
+                    })
+                    .catch(error => alert('An error occurred during comment deletion: ' + error.message));
+                }
+            }
+
+
+            // Function to update upvote/comment counts in the `displayedContent` array
+            function updateContentCounts(contentId, newUpvotes = null, newComments = null) {
+                const contentIndex = displayedContent.findIndex(item => item.content_id == contentId);
+                if (contentIndex !== -1) {
+                    if (newUpvotes !== null) {
+                        displayedContent[contentIndex].upvotes = newUpvotes;
+                    }
+                    if (newComments !== null) {
+                        displayedContent[contentIndex].comments_count = newComments;
+                    }
+                }
+            }
+
+
+            // --- Event Listeners for Magazine Functionality ---
+
+            // Open Magazine
+            openMagazineBtn.addEventListener('click', () => {
+                console.log("Explore button clicked.");
+                if (allPublishedContent.length === 0) {
+                    alert('No content available to display yet. Check back later!');
+                    return;
+                }
+                magazineCoverContainer.classList.add('open');
+                console.log("Added 'open' class to magazineCoverContainer.");
+
+                setTimeout(() => {
+                    magazineCoverContainer.style.display = 'none';
+                    magazineReaderContainer.style.display = 'flex';
+                    magazineReaderContainer.classList.add('show');
+                    console.log("Magazine reader should now be visible.");
+                    displayContentWithAnimation(currentPageIndex, 'initial'); // Initial display without explicit slide
+                }, 900);
+            });
+
+            // Previous Content
+            prevContentBtn.addEventListener('click', () => {
+                if (currentPageIndex > 0) {
+                    displayContentWithAnimation(currentPageIndex - 1, 'prev');
+                }
+            });
+
+            // Next Content
+            nextContentBtn.addEventListener('click', () => {
+                if (currentPageIndex < displayedContent.length - 1) {
+                    displayContentWithAnimation(currentPageIndex + 1, 'next');
+                }
+            });
+
+            // Sort by Latest
+            sortLatestBtn.addEventListener('click', () => {
+                displayedContent.sort((a, b) => new Date(b.published_at) - new Date(a.published_at));
+                sortLatestBtn.classList.add('active');
+                sortUpvotesBtn.classList.remove('active');
+                displayContentWithAnimation(0, 'initial'); // Reset and display first page
+            });
+
+            // Sort by Most Upvoted
+            sortUpvotesBtn.addEventListener('click', () => {
+                displayedContent.sort((a, b) => b.upvotes - a.upvotes);
+                sortUpvotesBtn.classList.add('active');
+                sortLatestBtn.classList.remove('active');
+                displayContentWithAnimation(0, 'initial'); // Reset and display first page
+            });
+
+            // --- Full Content Modal Logic (for competition details/fallback) ---
+            fullContentModalCloseButton.addEventListener("click", function() {
+                fullContentModal.style.display = "none";
+                modalTitle.textContent = '';
+                modalAuthor.textContent = '';
+                modalContentBody.innerHTML = '';
+                loadingSpinner.style.display = 'none';
+            });
+
+            window.addEventListener("click", function(event) {
+                if (event.target == fullContentModal) {
+                    fullContentModal.style.display = "none";
+                    modalTitle.textContent = '';
+                    modalAuthor.textContent = '';
+                    loadingSpinner.style.display = 'none';
+                }
+            });
+
+            // Initial display check (if no content, show message)
+            if (allPublishedContent.length === 0) {
+                magazineReaderContainer.style.display = 'none';
+                magazineCoverContainer.style.display = 'flex';
+                openMagazineBtn.disabled = true;
+                openMagazineBtn.textContent = 'No Content Yet';
+                console.log("No content available, button disabled.");
+            } else {
+                openMagazineBtn.disabled = false;
+                console.log("Content available, button enabled.");
+            }
+        });
+    </script>
+</body>
+</html>
